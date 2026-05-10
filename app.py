@@ -40,10 +40,11 @@ st.caption("Multi-model time series forecasting, testing, and trading simulation
 # CONSTANTS
 # =====================
 MODEL_NAMES = ["ARIMA", "SARIMA", "SARIMAX", "Prophet", "RandomForest", "XGBoost"]
+FORECAST_HORIZON = 5
+
 STOCK_LOADERS = {
     "Reliance": load_raw_data,
 }
-FORECAST_HORIZON = 5
 
 
 # =====================
@@ -59,10 +60,13 @@ def clean_array(values):
 def to_price(values, index=None):
     arr = np.exp(clean_array(values))
     if index is not None:
-        return pd.Series(arr[:len(index)], index=index)
+        return pd.Series(arr[: len(index)], index=index)
+    if isinstance(values, pd.Series):
+        return pd.Series(arr, index=values.index)
     return pd.Series(arr)
 
 
+@st.cache_data(show_spinner=False)
 def load_stock_data(stock_name: str) -> pd.DataFrame:
     if stock_name not in STOCK_LOADERS:
         raise ValueError(f"Unknown stock: {stock_name}")
@@ -73,7 +77,8 @@ def load_stock_data(stock_name: str) -> pd.DataFrame:
     return df
 
 
-def get_model(model_name: str):
+@st.cache_resource(show_spinner=False)
+def load_final_model(model_name: str):
     return load_model(f"{model_name}_final")
 
 
@@ -101,7 +106,7 @@ def predict_future(model_name: str, model, full_df: pd.DataFrame):
     return clean_array(preds)
 
 
-def ensemble_pred(pred_dict: dict):
+def build_ensemble(pred_dict: dict):
     if not pred_dict:
         raise ValueError("No predictions available for ensemble.")
     preds_df = pd.DataFrame(pred_dict)
@@ -121,7 +126,6 @@ def eval_metrics(actual_log: pd.Series, pred_log) -> dict:
 
     mae = float(np.mean(np.abs(actual_price - pred_price)))
     rmse = float(np.sqrt(np.mean((actual_price - pred_price) ** 2)))
-
     direction = ((pred_price.diff() > 0) == (actual_price.diff() > 0)).mean()
 
     return {
@@ -131,7 +135,7 @@ def eval_metrics(actual_log: pd.Series, pred_log) -> dict:
     }
 
 
-def plot_test_prediction(actual_price: pd.Series, pred_price: pd.Series, model_name: str):
+def make_test_fig(actual_price: pd.Series, pred_price: pd.Series, model_name: str):
     fig = go.Figure()
 
     fig.add_trace(
@@ -140,7 +144,7 @@ def plot_test_prediction(actual_price: pd.Series, pred_price: pd.Series, model_n
             y=actual_price.values,
             mode="lines",
             name="Actual",
-            line=dict(color="#1f77b4", width=2),  # blue
+            line=dict(color="#1f77b4", width=3),  # blue
         )
     )
 
@@ -150,7 +154,8 @@ def plot_test_prediction(actual_price: pd.Series, pred_price: pd.Series, model_n
             y=pred_price.values,
             mode="lines+markers",
             name=f"{model_name} Prediction",
-            line=dict(color="#008080", width=2),  # teal
+            line=dict(color="#17a2b8", width=3, dash="dash"),  # teal
+            marker=dict(size=7),
         )
     )
 
@@ -162,10 +167,11 @@ def plot_test_prediction(actual_price: pd.Series, pred_price: pd.Series, model_n
         yaxis_title="Price",
         legend_title="Series",
     )
+    fig.update_xaxes(type="date")
     return fig
 
 
-def plot_future_prediction(pred_price: pd.Series, model_name: str):
+def make_future_fig(pred_price: pd.Series, model_name: str):
     fig = go.Figure()
 
     fig.add_trace(
@@ -174,7 +180,8 @@ def plot_future_prediction(pred_price: pd.Series, model_name: str):
             y=pred_price.values,
             mode="lines+markers",
             name=f"{model_name} Forecast",
-            line=dict(color="#2ca02c", width=3),  # green
+            line=dict(color="#2ca02c", width=3),
+            marker=dict(size=7),
         )
     )
 
@@ -186,6 +193,7 @@ def plot_future_prediction(pred_price: pd.Series, model_name: str):
         yaxis_title="Price",
         legend_title="Series",
     )
+    fig.update_xaxes(type="date")
     return fig
 
 
@@ -206,8 +214,6 @@ def investment_projection(pred_price: pd.Series, initial_investment: float, last
 # SIDEBAR
 # =====================
 st.sidebar.header("Controls")
-st.sidebar.info("Forecast horizon is fixed at 5 business days.")
-
 stock_name = st.sidebar.selectbox("Select stock", list(STOCK_LOADERS.keys()), index=0)
 selected_model = st.sidebar.selectbox("Select model", MODEL_NAMES + ["Ensemble"], index=0)
 initial_investment = st.sidebar.number_input(
@@ -216,6 +222,8 @@ initial_investment = st.sidebar.number_input(
     value=1000.0,
     step=100.0,
 )
+
+st.sidebar.info("Forecast horizon is fixed at 5 business days.")
 
 
 # =====================
@@ -229,8 +237,9 @@ except Exception as e:
 
 train, test = train_test_split_time(df, SPLIT_DATE)
 
-actual_test_price = to_price(test["target"])
-full_price = to_price(df["target"])
+train_price = to_price(train["target"], index=train.index)
+test_price = to_price(test["target"], index=test.index)
+full_price = to_price(df["target"], index=df.index)
 last_close = float(full_price.iloc[-1])
 
 st.subheader(f"Stock: {stock_name}")
@@ -251,7 +260,7 @@ errors = {}
 with st.spinner("Loading final models and generating predictions..."):
     for model_name in MODEL_NAMES:
         try:
-            model = get_model(model_name)
+            model = load_final_model(model_name)
 
             test_pred = predict_test(model_name, model, test)
             future_pred = predict_future(model_name, model, df)
@@ -264,19 +273,23 @@ with st.spinner("Loading final models and generating predictions..."):
 
     if test_preds:
         try:
-            test_preds["Ensemble"] = ensemble_pred(test_preds)
+            test_preds["Ensemble"] = build_ensemble(test_preds)
         except Exception as e:
             errors["Ensemble (test)"] = str(e)
 
     if future_preds:
         try:
-            future_preds["Ensemble"] = ensemble_pred(future_preds)
+            future_preds["Ensemble"] = build_ensemble(future_preds)
         except Exception as e:
             errors["Ensemble (future)"] = str(e)
 
 available_models = list(test_preds.keys())
 if not available_models:
     st.error("No models could be loaded or predicted.")
+    if errors:
+        with st.expander("Model loading errors"):
+            for k, v in errors.items():
+                st.write(f"**{k}**: {v}")
     st.stop()
 
 if selected_model not in available_models:
@@ -302,7 +315,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "Overview",
     "Model Performance",
     "Future Forecast",
-    "Investment Simulator"
+    "Investment Simulator",
 ])
 
 
@@ -315,20 +328,20 @@ with tab1:
     split_fig = go.Figure()
     split_fig.add_trace(
         go.Scatter(
-            x=train.index,
-            y=to_price(train["target"]),
+            x=train_price.index,
+            y=train_price.values,
             mode="lines",
             name="Train",
-            line=dict(color="#1f77b4", width=2),
+            line=dict(color="#1f77b4", width=2),  # blue
         )
     )
     split_fig.add_trace(
         go.Scatter(
-            x=test.index,
-            y=actual_test_price,
+            x=test_price.index,
+            y=test_price.values,
             mode="lines",
             name="Test",
-            line=dict(color="#2ca02c", width=2),
+            line=dict(color="#17a2b8", width=2),  # teal
         )
     )
     split_fig.update_layout(
@@ -338,24 +351,27 @@ with tab1:
         xaxis_title="Date",
         yaxis_title="Price",
     )
+    split_fig.update_xaxes(type="date")
     st.plotly_chart(split_fig, use_container_width=True)
 
-    st.subheader(f"{selected_model}: Actual vs prediction on test data")
-    model_test_pred = pd.Series(
-        to_price(test_preds[selected_model]),
-        index=test.index[:len(test_preds[selected_model])]
+    st.subheader(f"{selected_model}: Test prediction")
+    n_test = min(len(test), len(test_preds[selected_model]))
+    actual_test_slice = test_price.iloc[:n_test]
+    pred_test_slice = pd.Series(
+        to_price(test_preds[selected_model]).values[:n_test],
+        index=test.index[:n_test],
     )
 
-    test_fig = plot_test_prediction(
-        actual_price=actual_test_price.iloc[:len(model_test_pred)],
-        pred_price=model_test_pred,
+    test_fig = make_test_fig(
+        actual_price=actual_test_slice,
+        pred_price=pred_test_slice,
         model_name=selected_model,
     )
     st.plotly_chart(test_fig, use_container_width=True)
 
     sel_metrics = eval_metrics(
-        test["target"].iloc[:len(test_preds[selected_model])],
-        test_preds[selected_model]
+        test["target"].iloc[:n_test],
+        test_preds[selected_model][:n_test],
     )
 
     m1, m2, m3 = st.columns(3)
@@ -364,7 +380,7 @@ with tab1:
     m3.metric("Direction accuracy", f"{sel_metrics['Direction_Accuracy']:.2%}")
 
     if errors:
-        with st.expander("Prediction / loading issues"):
+        with st.expander("Model / prediction issues"):
             for k, v in errors.items():
                 st.write(f"**{k}**: {v}")
 
@@ -403,19 +419,18 @@ with tab3:
     if selected_model not in future_preds:
         st.error(f"No future prediction available for {selected_model}")
     else:
-        selected_future_pred = pd.Series(
-            to_price(future_preds[selected_model]),
-            index=future_dates[:len(future_preds[selected_model])]
+        selected_future_pred_price = pd.Series(
+            to_price(future_preds[selected_model]).values,
+            index=future_dates[: len(future_preds[selected_model])],
         )
 
-        # Only predictions here — no actual line
-        future_fig = plot_future_prediction(selected_future_pred, selected_model)
+        future_fig = make_future_fig(selected_future_pred_price, selected_model)
         st.plotly_chart(future_fig, use_container_width=True)
 
         st.markdown("### Selected model forecast table")
         future_table = pd.DataFrame({
-            "Date": selected_future_pred.index,
-            "Forecast Price": selected_future_pred.values,
+            "Date": selected_future_pred_price.index,
+            "Forecast Price": selected_future_pred_price.values,
         })
         st.dataframe(future_table, use_container_width=True, hide_index=True)
 
@@ -423,11 +438,12 @@ with tab3:
     if future_preds:
         all_future_df = pd.DataFrame(
             {
-                name: to_price(preds)
+                name: to_price(preds).values
                 for name, preds in future_preds.items()
             },
-            index=future_dates
+            index=future_dates,
         )
+
         st.dataframe(all_future_df, use_container_width=True)
 
         all_future_fig = go.Figure()
@@ -447,9 +463,11 @@ with tab3:
             xaxis_title="Date",
             yaxis_title="Price",
         )
+        all_future_fig.update_xaxes(type="date")
         st.plotly_chart(all_future_fig, use_container_width=True)
     else:
         st.warning("No future forecasts were generated.")
+
 
 # =====================
 # TAB 4 — INVESTMENT SIMULATOR
@@ -461,8 +479,8 @@ with tab4:
         st.error(f"No future prediction available for {selected_model}")
     else:
         selected_future_price = pd.Series(
-            to_price(future_preds[selected_model]),
-            index=future_dates[:len(future_preds[selected_model])]
+            to_price(future_preds[selected_model]).values,
+            index=future_dates[: len(future_preds[selected_model])],
         )
 
         sim_df = investment_projection(
@@ -499,4 +517,5 @@ with tab4:
             xaxis_title="Date",
             yaxis_title="Portfolio value (₹)",
         )
+        invest_fig.update_xaxes(type="date")
         st.plotly_chart(invest_fig, use_container_width=True)
