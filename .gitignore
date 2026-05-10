@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
-models/*.pkl
 results/*.csv
 .vscode/
+
+models/*
+!models/*_final.pkl
